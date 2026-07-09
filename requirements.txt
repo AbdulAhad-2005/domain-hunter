@@ -1,0 +1,6 @@
+requests
+pyyaml
+openpyxl
+dnspython
+tldextract
+beautifulsoup4

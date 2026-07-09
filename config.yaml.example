@@ -1,0 +1,12 @@
+shodan_api_key: null
+censys_personal_access_token: null   # Platform API bearer PAT, not an API ID+secret pair
+censys_organization_id: null          # optional; Free-tier accounts don't have one
+securitytrails_api_key: null
+whoisxml_api_key: null
+builtwith_api_key: null
+google_search_api_key: null
+google_search_cx: null
+llm_provider: null        # "anthropic" | "gemini" | "openai" | "custom"
+llm_api_key: null
+llm_base_url: null         # for custom OpenAI-compatible endpoints
+llm_model: null            # optional override; each provider has a built-in default

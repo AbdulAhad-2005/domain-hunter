@@ -1,0 +1,13 @@
+config.yaml
+METHODOLOGY.md
+__pycache__/
+*.pyc
+.venv/
+venv/
+*-venv/
+*.egg-info/
+.claude/
+findings.csv
+findings.xlsx
+findings_*.csv
+findings_*.xlsx
