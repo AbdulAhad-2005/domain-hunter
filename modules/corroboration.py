@@ -160,9 +160,6 @@ def corroborate(candidate: str, seed_domain: str, context: "SeedContext | None")
         if candidate_hash and candidate_hash == context.seed_favicon_md5:
             return "favicon_hash", "identical favicon MD5 hash to the seed"
 
-    if context.seed_brand_tokens and _shares_brand_token(candidate, context.seed_brand_tokens):
-        return "brand_token", f"candidate label matches seed brand token(s) {context.seed_brand_tokens}"
-
     return None, None
 
 
