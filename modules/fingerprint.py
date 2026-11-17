@@ -3,9 +3,10 @@ import binascii
 import hashlib
 import logging
 import re
-from urllib.parse import urljoin
+from urllib.parse import quote_plus, urljoin
 
 import requests
+import tldextract
 from bs4 import BeautifulSoup
 
 from core.models import Finding
@@ -24,28 +25,20 @@ _FB_PIXEL_URL_RE = re.compile(r"facebook\.com/tr\?id=(\d{10,20})")
 
 
 class FingerprintModule(ReconModule):
-    """Web fingerprinting on the seed domain's own homepage (free parts only).
+    """Web fingerprinting on the seed domain's own homepage with free tracker pivoting.
 
     Self-fetches the homepage HTML and extracts tracking/analytics IDs (GA
-    Universal/GA4, GTM, Facebook Pixel) via regex, plus the favicon's MD5
-    hash. None of these, on their own, name a second domain -- unlike
-    dns_infra's MX/SPF records, a GA ID or a hash isn't a hostname. Turning
-    them into associated-domain evidence needs a reverse index of other sites
-    using the same ID/hash (paid: BuiltWith/DNSlytics/SpyOnWeb for tag IDs,
-    Shodan for favicon hash search), so per PROJECT_OVERVIEW.md 4.2 this
-    module's free path stops at self.fingerprint -- same "seed-only recon, no
-    Finding yet" shape as whois_lookup.py. run() always returns [].
+    Universal/GA4, GTM, Facebook Pixel) via regex, page title, plus the favicon's
+    MD5 hash.
 
-    The Shodan favicon-hash search step is explicitly out of scope here
-    (separate task). Note for whoever builds it: Shodan's http.favicon.hash
-    field is an mmh3 (MurmurHash3) hash of the base64-encoded icon, NOT the
-    MD5 stored here -- that step will need its own hash computed over the
-    same favicon bytes, not this one.
+    Pivots on extracted tracker IDs using urlscan.io's free search API (no key
+    needed) to discover associated domains sharing the same tracking/analytics
+    infrastructure.
     """
 
     name = "fingerprint"
     requires_key = None
-    produces_findings = False
+    produces_findings = True
 
     def __init__(self, config):
         super().__init__(config)
@@ -58,15 +51,82 @@ class FingerprintModule(ReconModule):
             self.fingerprint = {}
             return []
 
+        title = self._find_title(html)
+        ga_id = self._first_match(_GA_UA_RE, html) or self._first_match(_GA4_RE, html)
+        gtm_id = self._first_match(_GTM_RE, html)
+        fb_pixel_id = (
+            self._first_match(_FB_PIXEL_RE, html) or self._first_match(_FB_PIXEL_URL_RE, html)
+        )
+        favicon_md5 = self._favicon_md5(html, base_url)
+
         self.fingerprint = {
-            "ga_id": self._first_match(_GA_UA_RE, html) or self._first_match(_GA4_RE, html),
-            "gtm_id": self._first_match(_GTM_RE, html),
-            "fb_pixel_id": (
-                self._first_match(_FB_PIXEL_RE, html) or self._first_match(_FB_PIXEL_URL_RE, html)
-            ),
-            "favicon_md5": self._favicon_md5(html, base_url),
+            "title": title,
+            "ga_id": ga_id,
+            "gtm_id": gtm_id,
+            "fb_pixel_id": fb_pixel_id,
+            "favicon_md5": favicon_md5,
         }
-        return []
+
+        tracker_ids: list[str] = []
+        for pat in (_GA_UA_RE, _GA4_RE, _GTM_RE):
+            for m in pat.findall(html):
+                if m not in tracker_ids:
+                    tracker_ids.append(m)
+        for pat in (_FB_PIXEL_RE, _FB_PIXEL_URL_RE):
+            for m in pat.findall(html):
+                val = m if isinstance(m, str) else m[0]
+                if val and val not in tracker_ids:
+                    tracker_ids.append(val)
+
+        findings: list[Finding] = []
+        seen_domains: set[str] = set()
+
+        for tid in tracker_ids[:5]:
+            discovered = self._pivot_tracker_urlscan(tid, domain)
+            for assoc in discovered:
+                if assoc != domain and assoc not in seen_domains:
+                    seen_domains.add(assoc)
+                    findings.append(
+                        Finding(
+                            seed_domain=domain,
+                            associated_domain=assoc,
+                            method="tracker_pivot",
+                            evidence=f"shared analytics/pixel ID {tid} with {domain}",
+                            raw_data={"tracker_id": tid},
+                            confidence="high",
+                        )
+                    )
+
+        return findings
+
+    def _pivot_tracker_urlscan(self, tracker_id: str, seed_domain: str) -> list[str]:
+        """Query urlscan.io free search API for pages sharing this tracker ID."""
+        url = f"https://urlscan.io/api/v1/search/?q=page.trackers.{quote_plus(tracker_id)}&size=20"
+        try:
+            resp = requests.get(url, timeout=_TIMEOUT, headers={"User-Agent": _USER_AGENT})
+            if not resp.ok:
+                return []
+            results = resp.json().get("results", [])
+            discovered: list[str] = []
+            for r in results:
+                page_domain = r.get("page", {}).get("domain", "")
+                if not page_domain:
+                    continue
+                ext = tldextract.extract(page_domain.lower())
+                if ext.domain and ext.suffix:
+                    rd = f"{ext.domain}.{ext.suffix}"
+                    if rd != seed_domain and rd not in discovered:
+                        discovered.append(rd)
+            return discovered
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("fingerprint: urlscan tracker pivot failed for %s: %s", tracker_id, exc)
+            return []
+
+    @staticmethod
+    def _find_title(html: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.find("title")
+        return title_tag.get_text().strip() if title_tag else ""
 
     def _fetch_homepage(self, domain: str) -> tuple[str | None, str | None]:
         for scheme in ("https", "http"):

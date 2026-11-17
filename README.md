@@ -61,17 +61,25 @@ Run with `--modules name1,name2,...` (default: all of them). Free unless noted.
 | Name | What it does |
 |---|---|
 | `certs` | Certificate transparency search via crt.sh (SAN co-occurrence) |
-| `dns` | NS/MX/TXT(SPF) recon on the seed; surfaces non-provider MX/SPF targets |
+| `dns` | NS/MX/TXT(SPF)/DMARC recon on the seed with brand-affiliation gating (excludes third-party providers) |
 | `asn` | ASN/IP block ownership via bgpview.io |
 | `tld_variants` | Seed's label checked across common TLDs/ccTLDs, corroboration-gated |
 | `pattern_gen` | Rule-based label variants (+group, +mobile, etc.), corroboration-gated |
-| `knowledge_recon` | Wikidata: subsidiary/owned-by/parent/product/developer/affiliation relationships |
-| `site_scrape` | Self-scrapes the seed's own homepage + relationship pages for org-listed links |
-| `whois_lookup` | RDAP recon on the seed (registrant org/email, registrar) — feeds other modules, produces no findings itself |
-| `fingerprint` | GA/GTM/Pixel IDs + favicon hash on the seed — feeds other modules, produces no findings itself |
+| `knowledge_recon` | Wikidata Action API + Wikipedia infobox: subsidiary/parent/owner traversal with institutional shareholder filtering |
+| `site_scrape` | Self-scrapes seed homepage, relationship pages, robots.txt, and sitemap.xml with brand affiliation gating |
+| `whois_lookup` | RDAP recon on the seed (free); reverse WHOIS via Whoxy across registrant email/company/name when keyed |
+| `fingerprint` | GA/GTM/Pixel IDs + favicon hash on the seed; free tracker pivoting via urlscan.io |
 | `ai_hunt` | **Keyed** (needs `llm_provider`/`llm_api_key` in config.yaml) — LLM hypothesis generation, every suggestion independently verified before being recorded. Skipped entirely with no key configured. |
 
-`certs`/`dns`/`asn`/`knowledge_recon` also have a paid/keyed upgrade path (Censys, WhoisXML, etc.) documented in PROJECT_OVERVIEW.md §4 — not required for normal use.
+`certs`/`dns`/`asn`/`knowledge_recon`/`whois_lookup` also have a paid/keyed upgrade path (Censys, Whoxy, etc.) documented in PROJECT_OVERVIEW.md §4 — not required for normal use.
+
+## Testing
+
+Run unit tests via `pytest`:
+
+```bash
+pytest
+```
 
 ## Responsible use
 

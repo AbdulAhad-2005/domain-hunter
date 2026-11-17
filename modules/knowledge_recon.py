@@ -1,127 +1,55 @@
 import logging
 import re
+import time
 from urllib.parse import urlparse
 
 import requests
+import tldextract
+from bs4 import BeautifulSoup
 
 from core.models import Finding
 from modules.base import ReconModule
+from modules.corroboration import _brand_tokens, _shares_brand_token
 
 logger = logging.getLogger(__name__)
 
-_SPARQL_URL = "https://query.wikidata.org/sparql"
-_TIMEOUT = 20
+_TIMEOUT = 12
 _USER_AGENT = "DomainHunter/0.1 (OSINT recon tool)"
 
-_QID_RE = re.compile(r"^Q\d+$")
+_FINANCIAL_INSTITUTION_WORDS = (
+    "investment", "asset management", "capital management", "hedge fund",
+    "mutual fund", "pension fund", "sovereign wealth fund", "private equity",
+    "venture capital", "wealth management", "index fund", "fund manager",
+    "financial services",
+)
+_HUMAN_QID = "Q5"
+_WIKI_SELF = frozenset({
+    "wikipedia.org", "wikimedia.org", "wiktionary.org", "wikidata.org", "creativecommons.org"
+})
 
-_ENTITY_QUERY = """
-SELECT DISTINCT ?item ?itemLabel ?website ?isOrg WHERE {{
-  VALUES ?website {{ {uri_values} }}
-  ?item wdt:P856 ?website .
-  BIND(EXISTS {{ ?item wdt:P31/wdt:P279* wd:Q43229 }} AS ?isOrg)
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}}
-ORDER BY DESC(?isOrg)
-"""
-
-_RELATIONS_QUERY = """
-SELECT DISTINCT ?relation ?related ?relatedLabel ?website WHERE {{
-  {{ wd:{qid} wdt:P355 ?related . BIND("subsidiary" AS ?relation) }}
-  UNION {{ ?related wdt:P127 wd:{qid} . BIND("owned_by" AS ?relation) }}
-  UNION {{ wd:{qid} wdt:P1830 ?related . BIND("owned_by" AS ?relation) }}
-  UNION {{ ?related wdt:P749 wd:{qid} . BIND("parent_organization" AS ?relation) }}
-  UNION {{ wd:{qid} wdt:P1056 ?related . BIND("product" AS ?relation) }}
-  UNION {{ ?related wdt:P178 wd:{qid} . BIND("developer_of" AS ?relation) }}
-  UNION {{ ?related wdt:P1416 wd:{qid} . BIND("affiliated_with" AS ?relation) }}
-  OPTIONAL {{ ?related wdt:P856 ?website }}
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}}
-"""
-
-# Other entities (besides the seed) that co-own a related entity via P127/P749
-# -- surfaces the partner side of a joint venture (e.g. "HAL 49% + BAE 40%"
-# style JVs are frequently only documented under the FOREIGN partner's own
-# Wikidata entity/site, not the target's, so this at least names who to look
-# at next rather than silently dropping the relationship).
-_CO_OWNERS_QUERY = """
-SELECT DISTINCT ?owner ?ownerLabel WHERE {{
-  {{ wd:{related_qid} wdt:P127 ?owner }} UNION {{ wd:{related_qid} wdt:P749 ?owner }}
-  FILTER(?owner != wd:{seed_qid})
-  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-}}
-"""
-
-_RELATION_VERBS = {
-    "subsidiary": "has subsidiary",
-    "owned_by": "owns",
-    "parent_organization": "is parent organization of",
-    "product": "produces",
-    "developer_of": "is developer of",
-    "affiliated_with": "is affiliated with",
-}
-
-# Ownership-type relations where a co-owner check is worth the extra query --
-# "product"/"developer_of"/"affiliated_with" don't have a meaningful
-# ownership-percentage/partner concept.
-_OWNERSHIP_RELATIONS = {"subsidiary", "owned_by", "parent_organization"}
+_AFFILIATION_ROW_LABELS = frozenset({
+    "website", "websites", "official website", "homepage", "url",
+    "owner", "owned by", "parent", "parent company", "parent organisation",
+    "parent organization", "subsidiaries", "subsidiary",
+})
 
 
 class KnowledgeReconModule(ReconModule):
-    """Organizational-relationship recon via Wikidata (free, no key).
+    """Organizational-relationship recon via Wikidata & Wikipedia (free, no key).
 
-    Finds the Wikidata entity whose official website (P856) matches the seed
-    domain, then pulls structured relationships -- subsidiary (P355), owned
-    by (P127/P1830), parent organization (P749), product/material produced
-    (P1056), developer (P178, reverse), affiliated organization (P1416,
-    reverse, for alumni associations/foundations/affiliated bodies) -- and
-    maps each related entity to its own P856 official website.
+    Replaces fragile, timeout-prone SPARQL queries with the fast Wikidata Action
+    API (wbsearchentities + batched wbgetentities) and Wikipedia infobox parsing.
 
-    This is the module built to catch the class of associated domains the
-    infrastructure-based modules (certs, dns_infra, tld_variants,
-    pattern_gen) structurally cannot: domains linked by organizational
-    knowledge rather than shared hosting/DNS/certs, e.g. a telecom's mobile
-    subsidiary (ufone.com for ptcl.com.pk) or a research org's product
-    (bosslinux.in for cdac.in). Every Finding traces back to a specific
-    Wikidata statement (stored in raw_data), so confidence is "high" -- this
-    is a sourced, structured relationship, not a guess.
-
-    Joint ventures with partial/shared ownership are NOT rejected for being
-    less than wholly-owned -- P127/P749 just need to include the seed's QID
-    among possibly several. When a related entity has ownership-type relation
-    (subsidiary/owned_by/parent_organization), a second lightweight query
-    checks for OTHER co-owners of that same entity and names them in the
-    evidence (e.g. "co-owned with: BAE Systems") -- Wikidata frequently files
-    a JV under the FOREIGN partner's entity rather than the target's, so
-    surfacing the partner name points a human at where to look next, even
-    though following the partner's own graph/site is out of scope here.
-
-    Entity resolution is deliberately narrow: only a P856 back-reference to
-    the exact seed domain, not a name search. A name-based fallback
-    (wbsearchentities) would catch more orgs that aren't in Wikidata with a
-    matching official-website statement, but risks silently picking a
-    different, same-named entity with no way to verify the match -- a real
-    risk given this module's whole point is reporting only *confirmed*
-    relationships. "No Wikidata entity found" is logged and returned as an
-    honest empty result rather than guessed at.
-
-    Even a same-URL match isn't automatically unambiguous: testing against
-    cdac.in initially matched Q136504968 ("PARAM Siddhi-AI", a supercomputer
-    CDAC built) instead of Q3519908 (CDAC itself), because the product's own
-    P856 statement is also set to cdac.in and SPARQL result order isn't
-    otherwise defined. Fixed by ordering matches so an entity that is
-    (transitively) `instance of` organization (Q43229) in Wikidata's own
-    class hierarchy is preferred over one that isn't, rather than hardcoding
-    a list of "organization-like" P31 values.
-
-    Adding P1416 (affiliated_with) surfaced a second bug: NUST's constituent
-    schools (e.g. NUST School of Mechanical and Manufacturing Engineering)
-    are P1416-affiliated with NUST itself, and their P856 websites are
-    subdomains of nust.edu.pk (smme.nust.edu.pk etc.) -- not a separate
-    associated domain, just part of the seed's own site. Now excluded via the
-    same "is it a subdomain of the seed" check certs.py/dns_infra.py already
-    use, rather than treating every related-entity website as automatically
-    distinct from the seed.
+    Features:
+      1. Multi-tier entity resolution (seed domain, homepage title, brand token),
+         verifying that the entity's own P856 (official website) matches the seed.
+      2. Traversal of corporate hierarchy:
+         - P355: subsidiary
+         - P749: parent organization
+         - P127: owned by (filtered to reject financial funds/human shareholders)
+      3. Chases related entities to their own P856 official websites.
+      4. Wikipedia Infobox parsing for verified corporate affiliation rows
+         (website, owner, parent, subsidiaries) with stock-exchange filter.
     """
 
     name = "knowledge_recon"
@@ -130,128 +58,253 @@ class KnowledgeReconModule(ReconModule):
     def __init__(self, config):
         super().__init__(config)
         self.entity_label: str | None = None
+        self.entity_qid: str | None = None
 
     def run(self, domain: str) -> list[Finding]:
-        logger.info("knowledge_recon: querying Wikidata for entity with official website matching %s", domain)
-        qid, entity_label = self._find_entity(domain)
-        if qid is None:
-            logger.info(
-                "knowledge_recon: no Wikidata entity found with official website matching %s", domain
-            )
-            return []
-        self.entity_label = entity_label
+        logger.info("knowledge_recon: querying Wikidata & Wikipedia for %s", domain)
+        session = requests.Session()
+        session.headers.update({"User-Agent": _USER_AGENT})
 
-        rows = self._query_relations(qid)
-        findings = []
+        brand_tokens = _brand_tokens(domain)
+        brand = brand_tokens[0] if brand_tokens else domain.split(".")[0]
+
+        findings: list[Finding] = []
         seen = {domain}
-        for row in rows:
-            website = row.get("website", {}).get("value")
-            if not website:
-                continue
-            related_domain = self._extract_domain(website)
-            if (
-                not related_domain
-                or related_domain in seen
-                or related_domain.endswith(f".{domain}")
-            ):
-                continue
-            seen.add(related_domain)
 
-            relation = row["relation"]["value"]
-            related_label = row.get("relatedLabel", {}).get("value", row["related"]["value"])
-            related_qid = row["related"]["value"].rsplit("/", 1)[-1]
-            verb = _RELATION_VERBS.get(relation, relation)
+        # Step 1: Wikidata corporate hierarchy traversal
+        wikidata_sites = self._wikidata_affiliated_sites(session, domain, brand)
+        for related_domain, context in wikidata_sites.items():
+            if related_domain not in seen:
+                seen.add(related_domain)
+                findings.append(Finding(
+                    seed_domain=domain,
+                    associated_domain=related_domain,
+                    method="knowledge_graph_wikidata",
+                    evidence=context,
+                    raw_data={"source": "wikidata", "domain": related_domain},
+                    confidence="high",
+                ))
 
-            co_owners = []
-            if relation in _OWNERSHIP_RELATIONS:
-                co_owners = self._query_co_owners(related_qid, qid)
-            jv_note = f" (also co-owned by: {', '.join(co_owners)} -- check that side's own site/Wikidata too)" if co_owners else ""
+        # Step 2: Wikipedia infobox relationship parsing
+        wiki_sites = self._wikipedia_infobox_sites(session, domain, brand_tokens)
+        for related_domain, context in wiki_sites.items():
+            if related_domain not in seen:
+                seen.add(related_domain)
+                findings.append(Finding(
+                    seed_domain=domain,
+                    associated_domain=related_domain,
+                    method="wikipedia_infobox",
+                    evidence=context,
+                    raw_data={"source": "wikipedia_infobox", "domain": related_domain},
+                    confidence="high",
+                ))
 
-            findings.append(Finding(
-                seed_domain=domain,
-                associated_domain=related_domain,
-                method=f"knowledge_graph_{relation}",
-                evidence=(
-                    f"Wikidata: {entity_label} ({qid}) {verb} {related_label} ({related_qid}), "
-                    f"whose official website (P856) is {website}{jv_note}"
-                ),
-                raw_data={
-                    "seed_qid": qid,
-                    "related_qid": related_qid,
-                    "relation": relation,
-                    "website": website,
-                    "co_owners": co_owners,
-                },
-                confidence="high",
-            ))
         return findings
 
-    def _query_co_owners(self, related_qid: str, seed_qid: str) -> list[str]:
-        if not (_QID_RE.match(related_qid) and _QID_RE.match(seed_qid)):
-            return []
-        rows = self._sparql(_CO_OWNERS_QUERY.format(related_qid=related_qid, seed_qid=seed_qid))
-        return [r["ownerLabel"]["value"] for r in rows if r.get("ownerLabel", {}).get("value")]
+    # --------------------------------------------------------------------------
+    # Wikidata Action API methods
+    # --------------------------------------------------------------------------
+    def _wikidata_affiliated_sites(
+        self, session: requests.Session, seed_root: str, brand: str
+    ) -> dict[str, str]:
+        """Resolves seed to Wikidata entity, then pulls subsidiaries (P355),
+        parents (P749), and verified controlling entities (P127), mapping each
+        to its P856 official website."""
+        entity = None
+        for query in (seed_root, brand):
+            query = query.strip()
+            if not query:
+                continue
+            qids = self._wikidata_entity_ids(session, query)
+            if not qids:
+                continue
+            candidates = self._wikidata_entities(session, qids)
+            for qid in qids:
+                cand = candidates.get(qid)
+                if not cand:
+                    continue
+                own_roots = {
+                    self._registrable_domain(u)
+                    for u in self._wikidata_claim_strings(cand, "P856")
+                }
+                if seed_root in own_roots:
+                    entity = cand
+                    self.entity_qid = qid
+                    self.entity_label = cand.get("labels", {}).get("en", {}).get("value", qid)
+                    break
+            if entity:
+                break
 
-    def _find_entity(self, domain: str) -> tuple[str | None, str | None]:
-        if not re.match(r"^[a-zA-Z0-9.-]+$", domain):
-            logger.warning("knowledge_recon: unexpected domain format %r, skipping", domain)
-            return None, None
+        if entity is None:
+            logger.info("knowledge_recon: no verified Wikidata entity found matching P856 for %s", seed_root)
+            return {}
 
-        # P856 (official website) comes back from wdt: as an RDF IRI, not a
-        # typed literal -- confirmed by querying a known entity (PTCL,
-        # Q7125719) directly and checking the JSON binding's "type" field.
-        # A `"..."^^xsd:anyURI` literal VALUES match silently returns zero
-        # rows against it.
-        uri_values = " ".join(f"<{uri}>" for uri in self._candidate_uris(domain))
-        query = _ENTITY_QUERY.format(uri_values=uri_values)
-        rows = self._sparql(query)
-        if not rows:
-            return None, None
-        item_uri = rows[0]["item"]["value"]
-        qid = item_uri.rsplit("/", 1)[-1]
-        label = rows[0].get("itemLabel", {}).get("value", qid)
-        return qid, label
+        unconditional_ids = self._wikidata_claim_ids(entity, "P355") + self._wikidata_claim_ids(entity, "P749")
+        p127_ids = set(self._wikidata_claim_ids(entity, "P127"))
+        related_ids = list(dict.fromkeys(unconditional_ids + list(p127_ids)))
+        if not related_ids:
+            return {}
 
-    @staticmethod
-    def _candidate_uris(domain: str) -> list[str]:
-        """Exact P856 (official website) URL variants to match against.
-        Wikidata's own SPARQL endpoint is too slow for a CONTAINS scan across
-        every P856 statement on the public query.wikidata.org service (hit a
-        real 20s+ timeout testing this) -- an exact VALUES match against the
-        handful of plausible URL forms is fast, since it hits an index."""
-        domain = domain.lower()
-        return [
-            f"{scheme}://{prefix}{domain}{suffix}"
-            for scheme in ("https", "http")
-            for prefix in ("", "www.")
-            for suffix in ("", "/")
-        ]
+        time.sleep(0.2)  # Wikidata rate-limit politeness
+        related = self._wikidata_entities(session, related_ids)
 
-    def _query_relations(self, qid: str) -> list[dict]:
-        if not _QID_RE.match(qid):
-            logger.warning("knowledge_recon: unexpected QID format %r, skipping", qid)
-            return []
-        return self._sparql(_RELATIONS_QUERY.format(qid=qid))
+        sites: dict[str, str] = {}
+        for related_qid, related_entity in related.items():
+            if related_qid in p127_ids and self._is_untrusted_p127_target(related_entity):
+                continue
+            rel_label = related_entity.get("labels", {}).get("en", {}).get("value", related_qid)
+            for url in self._wikidata_claim_strings(related_entity, "P856"):
+                rd = self._registrable_domain(url)
+                if rd and rd != seed_root and rd not in sites:
+                    sites[rd] = f"Wikidata: {rel_label} ({related_qid}), subsidiary/parent of {self.entity_label or seed_root}"
+        return sites
 
-    def _sparql(self, query: str) -> list[dict]:
+    def _wikidata_entity_ids(self, session: requests.Session, query: str, limit: int = 5) -> list[str]:
         try:
-            resp = requests.get(
-                _SPARQL_URL,
-                params={"query": query, "format": "json"},
-                headers={"Accept": "application/sparql-results+json", "User-Agent": _USER_AGENT},
+            resp = session.get(
+                "https://www.wikidata.org/w/api.php",
+                params={"action": "wbsearchentities", "search": query, "language": "en", "format": "json", "limit": limit},
                 timeout=_TIMEOUT,
             )
-            resp.raise_for_status()
-            return resp.json().get("results", {}).get("bindings", [])
-        except (requests.RequestException, ValueError) as exc:
-            logger.warning("knowledge_recon: SPARQL query failed: %s", exc)
+            hits = resp.json().get("search", []) if resp.ok else []
+            return [h["id"] for h in hits if h.get("id")]
+        except Exception as exc:
+            logger.debug("knowledge_recon: wbsearchentities failed for %s: %s", query, exc)
             return []
 
+    def _wikidata_entities(self, session: requests.Session, qids: list[str]) -> dict[str, dict]:
+        if not qids:
+            return {}
+        try:
+            resp = session.get(
+                "https://www.wikidata.org/w/api.php",
+                params={
+                    "action": "wbgetentities",
+                    "ids": "|".join(qids[:50]),
+                    "props": "claims|labels|descriptions",
+                    "languages": "en",
+                    "format": "json",
+                },
+                timeout=_TIMEOUT,
+            )
+            if not resp.ok:
+                return {}
+            return resp.json().get("entities", {})
+        except Exception as exc:
+            logger.debug("knowledge_recon: wbgetentities batch failed: %s", exc)
+            return {}
+
     @staticmethod
-    def _extract_domain(url: str) -> str | None:
-        parsed = urlparse(url)
-        netloc = parsed.netloc or urlparse(f"//{url}").netloc
-        host = netloc.split(":")[0].lower().strip("/")
-        if host.startswith("www."):
-            host = host[4:]
-        return host or None
+    def _wikidata_claim_ids(entity: dict, prop: str) -> list[str]:
+        out = []
+        for claim in entity.get("claims", {}).get(prop, []):
+            try:
+                out.append(claim["mainsnak"]["datavalue"]["value"]["id"])
+            except (KeyError, TypeError):
+                continue
+        return out
+
+    @staticmethod
+    def _wikidata_claim_strings(entity: dict, prop: str) -> list[str]:
+        out = []
+        for claim in entity.get("claims", {}).get(prop, []):
+            try:
+                val = claim["mainsnak"]["datavalue"]["value"]
+                if isinstance(val, str) and val.strip():
+                    out.append(val.strip())
+            except (KeyError, TypeError):
+                continue
+        return out
+
+    @staticmethod
+    def _is_untrusted_p127_target(entity: dict) -> bool:
+        """True when P127 (owned by) is a human or an institutional financial fund."""
+        p31 = {
+            c["mainsnak"]["datavalue"]["value"].get("id", "")
+            for c in entity.get("claims", {}).get("P31", [])
+            if "datavalue" in c.get("mainsnak", {})
+        }
+        if _HUMAN_QID in p31:
+            return True
+        text = " ".join([
+            entity.get("labels", {}).get("en", {}).get("value", ""),
+            entity.get("descriptions", {}).get("en", {}).get("value", ""),
+        ]).lower()
+        return any(word in text for word in _FINANCIAL_INSTITUTION_WORDS)
+
+    # --------------------------------------------------------------------------
+    # Wikipedia Infobox parsing
+    # --------------------------------------------------------------------------
+    def _wikipedia_infobox_sites(
+        self, session: requests.Session, seed_root: str, brand_tokens: list[str]
+    ) -> dict[str, str]:
+        """Resolves Wikipedia article via OpenSearch and extracts domains from
+        affiliation rows in the Infobox (website, owner, parent, subsidiaries)."""
+        brand = brand_tokens[0] if brand_tokens else seed_root.split(".")[0]
+        html = self._fetch_wikipedia_article(session, seed_root, brand)
+        if not html:
+            return {}
+
+        soup = BeautifulSoup(html, "html.parser")
+        infobox = soup.find("table", class_="infobox")
+        if not infobox:
+            return {}
+
+        all_box_text = infobox.get_text(" ", strip=True).lower()
+        is_seed_entity = (
+            seed_root in all_box_text
+            or any(_shares_brand_token(seed_root, [bt]) and bt in all_box_text for bt in brand_tokens)
+        )
+        if not is_seed_entity:
+            return {}
+
+        sites: dict[str, str] = {}
+        for row in infobox.find_all("tr"):
+            header = row.find("th")
+            label = header.get_text(" ", strip=True).lower() if header else ""
+            if label not in _AFFILIATION_ROW_LABELS:
+                continue
+
+            for a in row.find_all("a", href=True):
+                host = urlparse(a["href"]).hostname
+                if not host:
+                    continue
+                rd = self._registrable_domain(host)
+                if rd and rd != seed_root and rd not in _WIKI_SELF and rd not in sites:
+                    sites[rd] = f"Wikipedia infobox '{label}' row"
+
+            # Domain regex search in the row text
+            for host in re.findall(r"(?:https?://)?(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})", row.get_text(" ", strip=True)):
+                rd = self._registrable_domain(host)
+                if rd and rd != seed_root and rd not in _WIKI_SELF and rd not in sites:
+                    sites[rd] = f"Wikipedia infobox '{label}' row"
+
+        return sites
+
+    def _fetch_wikipedia_article(self, session: requests.Session, seed_root: str, brand: str) -> str:
+        for query in (seed_root, brand):
+            try:
+                resp = session.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={"action": "opensearch", "search": query, "limit": 1, "namespace": 0, "format": "json"},
+                    timeout=_TIMEOUT,
+                )
+                urls = resp.json()[3] if resp.ok else []
+                if urls:
+                    page = session.get(urls[0], timeout=_TIMEOUT)
+                    if page.ok:
+                        return page.text
+            except Exception as exc:
+                logger.debug("knowledge_recon: Wikipedia opensearch failed for %s: %s", query, exc)
+        return ""
+
+    @staticmethod
+    def _registrable_domain(url_or_host: str) -> str | None:
+        if not url_or_host:
+            return None
+        parsed = urlparse(url_or_host if "://" in url_or_host else f"//{url_or_host}")
+        host = (parsed.hostname or url_or_host).strip("./").lower()
+        ext = tldextract.extract(host)
+        if not ext.domain or not ext.suffix:
+            return None
+        return f"{ext.domain}.{ext.suffix}"

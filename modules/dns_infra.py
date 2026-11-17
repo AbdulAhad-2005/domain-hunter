@@ -7,6 +7,7 @@ import tldextract
 
 from core.models import Finding
 from modules.base import ReconModule
+from modules.corroboration import _brand_tokens, _shares_brand_token
 
 logger = logging.getLogger(__name__)
 
@@ -55,28 +56,51 @@ class DNSInfraModule(ReconModule):
         self.records: dict = {}
 
     def run(self, domain: str) -> list[Finding]:
-        logger.info("dns_infra: querying NS, MX, TXT records for %s", domain)
+        logger.info("dns_infra: querying NS, MX, TXT, DMARC records for %s", domain)
         resolver = dns.resolver.Resolver()
         resolver.lifetime = _TIMEOUT
 
         ns_records = self._query(resolver, domain, "NS")
         mx_records = self._query(resolver, domain, "MX")
         txt_records = self._query(resolver, domain, "TXT")
+        dmarc_records = self._query(resolver, f"_dmarc.{domain}", "TXT")
 
         spf_record = next((t for t in txt_records if t.lower().startswith("v=spf1")), None)
         spf_includes = self._parse_spf_includes(spf_record) if spf_record else []
+        dmarc_rua = self._parse_dmarc_rua(dmarc_records)
 
         self.records = {
             "ns": ns_records,
             "mx": mx_records,
             "txt": txt_records,
             "spf_includes": spf_includes,
+            "dmarc_rua": dmarc_rua,
         }
 
+        brand_tokens = _brand_tokens(domain)
+
         findings = []
-        findings.extend(self._mx_candidates(domain, mx_records))
-        findings.extend(self._spf_candidates(domain, spf_includes))
+        findings.extend(self._mx_candidates(domain, mx_records, brand_tokens))
+        findings.extend(self._spf_candidates(domain, spf_includes, brand_tokens))
+        findings.extend(self._dmarc_candidates(domain, dmarc_rua, brand_tokens))
         return findings
+
+    @staticmethod
+    def _parse_dmarc_rua(dmarc_records: list[str]) -> list[str]:
+        rua_domains = []
+        for txt in dmarc_records:
+            if not txt.lower().startswith("v=dmarc1"):
+                continue
+            for part in txt.split(";"):
+                part = part.strip()
+                if part.lower().startswith("rua="):
+                    for uri in part.split("=", 1)[1].split(","):
+                        uri = uri.strip().removeprefix("mailto:")
+                        if "@" in uri:
+                            host = uri.split("@")[-1].strip().lower()
+                            if host and host not in rua_domains:
+                                rua_domains.append(host)
+        return rua_domains
 
     def _query(self, resolver: dns.resolver.Resolver, domain: str, rtype: str) -> list[str]:
         try:
@@ -97,38 +121,78 @@ class DNSInfraModule(ReconModule):
     def _parse_spf_includes(spf_record: str) -> list[str]:
         return re.findall(r"include:([\w.-]+)", spf_record)
 
-    def _mx_candidates(self, domain: str, mx_records: list[str]) -> list[Finding]:
+    def _mx_candidates(self, domain: str, mx_records: list[str], brand_tokens: list[str]) -> list[Finding]:
         findings = []
         for mx in mx_records:
             host = mx.split()[-1].rstrip(".")  # "10 mail.example.com" -> "mail.example.com"
             host_domain = self._registrable_guess(host)
-            if host_domain and host_domain != domain and not self._is_known_provider(host_domain):
-                findings.append(Finding(
-                    seed_domain=domain,
-                    associated_domain=host_domain,
-                    method="mx_overlap",
-                    evidence=f"{domain}'s MX record points to {host}, hosted on {host_domain}",
-                    raw_data={"mx_record": mx},
-                    confidence="low",
-                ))
+            if not host_domain or host_domain == domain or self._is_known_provider(host_domain):
+                continue
+
+            # Affiliation gate: self-hosted infra sharing the brand token is a genuine sister domain.
+            # External providers/relays that don't share the brand token are third parties, not sisters.
+            if not _shares_brand_token(host_domain, brand_tokens):
+                continue
+
+            findings.append(Finding(
+                seed_domain=domain,
+                associated_domain=host_domain,
+                method="self_hosted_mail",
+                evidence=f"Self-hosted mail infra: {domain}'s MX points to {host} ({host_domain}) sharing brand token",
+                raw_data={"mx_record": mx, "shares_brand": True},
+                confidence="high",
+            ))
         return findings
 
-    def _spf_candidates(self, domain: str, spf_includes: list[str]) -> list[Finding]:
+    def _spf_candidates(self, domain: str, spf_includes: list[str], brand_tokens: list[str]) -> list[Finding]:
         findings = []
         for include in spf_includes:
             if (
-                include != domain
-                and not include.endswith(f".{domain}")
-                and not self._is_known_provider(include)
+                include == domain
+                or include.endswith(f".{domain}")
+                or self._is_known_provider(include)
             ):
-                findings.append(Finding(
-                    seed_domain=domain,
-                    associated_domain=include,
-                    method="spf_include",
-                    evidence=f"{domain}'s SPF record includes {include}",
-                    raw_data={"spf_include": include},
-                    confidence="low",
-                ))
+                continue
+
+            inc_domain = self._registrable_guess(include) or include
+            if inc_domain == domain or self._is_known_provider(inc_domain):
+                continue
+
+            if not _shares_brand_token(inc_domain, brand_tokens):
+                continue
+
+            findings.append(Finding(
+                seed_domain=domain,
+                associated_domain=inc_domain,
+                method="self_hosted_spf",
+                evidence=f"Self-hosted SPF infra: {domain}'s SPF includes {include} ({inc_domain}) sharing brand token",
+                raw_data={"spf_include": include, "shares_brand": True},
+                confidence="high",
+            ))
+        return findings
+
+    def _dmarc_candidates(self, domain: str, dmarc_rua: list[str], brand_tokens: list[str]) -> list[Finding]:
+        findings = []
+        for rua in dmarc_rua:
+            rua_domain = self._registrable_guess(rua) or rua
+            if (
+                rua_domain == domain
+                or rua_domain.endswith(f".{domain}")
+                or self._is_known_provider(rua_domain)
+            ):
+                continue
+
+            if not _shares_brand_token(rua_domain, brand_tokens):
+                continue
+
+            findings.append(Finding(
+                seed_domain=domain,
+                associated_domain=rua_domain,
+                method="self_hosted_dmarc",
+                evidence=f"Self-hosted DMARC reporting: {domain}'s DMARC rua points to {rua} sharing brand token",
+                raw_data={"dmarc_rua": rua, "shares_brand": True},
+                confidence="high",
+            ))
         return findings
 
     @staticmethod

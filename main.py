@@ -11,7 +11,7 @@ from core.exporter import export_csv, export_xlsx
 from modules.ai_hunt import AIHuntModule
 from modules.asn_recon import ASNReconModule
 from modules.certs import CertsModule
-from modules.corroboration import SeedContext
+from modules.corroboration import SeedContext, _brand_tokens
 from modules.dns_infra import DNSInfraModule
 from modules.fingerprint import FingerprintModule
 from modules.knowledge_recon import KnowledgeReconModule
@@ -93,7 +93,7 @@ def _mx_domain(mx_record: str) -> str | None:
     return f"{ext.domain}.{ext.suffix}"
 
 
-def _build_seed_context(findings: list, instances: dict) -> SeedContext:
+def _build_seed_context(findings: list, instances: dict, domain: str = "") -> SeedContext:
     """Gathers everything found about the seed itself by the base-stage
     modules, for tld_variants/pattern_gen to corroborate a resolving variant
     against (see modules/corroboration.py)."""
@@ -116,6 +116,12 @@ def _build_seed_context(findings: list, instances: dict) -> SeedContext:
             if asn_number:
                 seed_asns.add(asn_number)
 
+    title = ""
+    if fp_inst is not None and getattr(fp_inst, "fingerprint", None):
+        title = fp_inst.fingerprint.get("title") or ""
+
+    seed_brand_tokens = _brand_tokens(domain, title) if domain else []
+
     return SeedContext(
         known_domains={f.associated_domain for f in findings},
         seed_registrant_org=whois_inst.record.get("registrant_org") if whois_inst else None,
@@ -123,6 +129,7 @@ def _build_seed_context(findings: list, instances: dict) -> SeedContext:
         seed_mx_domains=seed_mx_domains,
         seed_asns=seed_asns,
         seed_favicon_md5=fp_inst.fingerprint.get("favicon_md5") if fp_inst else None,
+        seed_brand_tokens=seed_brand_tokens,
     )
 
 
@@ -223,7 +230,7 @@ def main():
         instances[name] = result["instance"]
 
     if context_modules:
-        seed_context = _build_seed_context(findings, instances)
+        seed_context = _build_seed_context(findings, instances, domain=args.domain)
         for name in context_modules:
             result = _run_module(name, config, args.domain, seed_context=seed_context)
             module_runs.append(result)

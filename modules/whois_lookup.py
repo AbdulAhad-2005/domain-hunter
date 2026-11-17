@@ -1,6 +1,8 @@
 import logging
+from urllib.parse import quote_plus
 
 import requests
+import tldextract
 
 from core.models import Finding
 from modules.base import ReconModule
@@ -10,36 +12,50 @@ logger = logging.getLogger(__name__)
 _RDAP_BOOTSTRAP_URL = "https://rdap.org/domain/{domain}"
 _TIMEOUT = 15
 
+# WHOIS privacy / registrar / forwarding apexes: when a seed uses privacy
+# protection the registrant is the privacy service, and reverse WHOIS on it
+# would return thousands of unrelated domains.
+_REGISTRAR_DOMAINS = frozenset({
+    "enom.com", "enom.net", "whoisguard.com", "whoisprivacyservices.com",
+    "domainsbyproxy.com", "privacyprotect.org", "contactprivacy.com",
+    "withheldforprivacy.com", "perfectprivacy.com", "namecheap.com",
+    "namesilo.com", "godaddy.com", "web.com", "squarespace.com",
+    "google.com", "googleapis.com", "cloudflare.com", "redactedforprivacy.com",
+    "dataprotected.com", "privatewhois.net", "hostedemail.com", "forwardemail.net",
+})
+
 
 class WhoisLookupModule(ReconModule):
-    """Forward WHOIS/RDAP lookup on the seed domain only.
+    """Forward WHOIS/RDAP lookup on the seed domain with optional Whoxy reverse WHOIS.
 
-    Per PROJECT_OVERVIEW.md 4.1, this is recon on the seed domain, not a
-    discovery method — it does NOT produce "associated domain" Findings.
-    `run()` always returns []; the parsed record (registrant org/email,
-    registrar, creation date, nameservers) is stored on self.record for a
-    future reverse_whois.py (paid/keyed: WhoisXML, DomainTools, ViewDNS) to
-    pivot on.
+    Free tier: Forward lookup via RDAP (rdap.org) on the seed domain only.
+    Populates self.record (registrant org/email, registrar, creation date,
+    nameservers) for downstream corroboration without emitting findings.
 
-    Uses RDAP (structured JSON over HTTPS, via the public rdap.org bootstrap
-    redirector) rather than raw port-43 WHOIS — RDAP responses are far less
-    fragile to parse than free-text WHOIS, which varies per registry/
-    registrar, and rdap.org needs no key. Coverage gap: RDAP isn't deployed
-    for every ccTLD yet, so some seed domains will legitimately come back
-    empty — that's an honest result, not a bug. A raw-WHOIS fallback (e.g.
-    python-whois) is a reasonable future addition if a specific ccTLD's lack
-    of RDAP coverage turns out to matter.
+    Paid tier (whoxy_api_key configured or WHOXY_API_KEY env): Queries Whoxy for
+    structured WHOIS data and executes reverse WHOIS pivoting across registrant
+    email, company name, and full name (filtering registrar privacy proxies),
+    producing high-confidence associated domain findings.
     """
 
     name = "whois_lookup"
-    requires_key = None
-    produces_findings = False
+    requires_key = "whoxy"
+    has_free_fallback = True
 
     def __init__(self, config):
         super().__init__(config)
         self.record: dict = {}
+        self.produces_findings = self.enabled_tier == "paid"
 
     def run(self, domain: str) -> list[Finding]:
+        if self.enabled_tier == "paid":
+            api_key = self.config.get("whoxy_api_key")
+            findings = self._query_whoxy(domain, api_key)
+            if self.record:
+                return findings
+            # Fall back to RDAP for self.record if Whoxy was empty or failed
+            logger.info("whois_lookup: Whoxy returned no record for %s, falling back to RDAP", domain)
+
         logger.info("whois_lookup: querying RDAP for %s", domain)
         data = self._query_rdap(domain)
         if data is None:
@@ -57,6 +73,88 @@ class WhoisLookupModule(ReconModule):
             ],
         }
         return []
+
+    def _query_whoxy(self, domain: str, api_key: str) -> list[Finding]:
+        whoxy_data = self._whoxy_whois(domain, api_key)
+        if not whoxy_data:
+            return []
+
+        contact = whoxy_data.get("registrant_contact", {})
+        email = contact.get("email_address", "").strip()
+        org = contact.get("company_name", "").strip()
+        name = contact.get("full_name", "").strip()
+
+        self.record = {
+            "registrar": whoxy_data.get("domain_registrar", {}).get("registrar_name"),
+            "registrant_org": org or None,
+            "registrant_email": email or None,
+            "creation_date": whoxy_data.get("create_date"),
+            "nameservers": [
+                ns.strip() for ns in whoxy_data.get("name_servers", []) if ns.strip()
+            ],
+        }
+
+        queries = []
+        if email and "@" in email:
+            queries.append(("email", email))
+        if org and len(org) >= 3:
+            queries.append(("company", org))
+        if name and len(name) >= 3:
+            queries.append(("name", name))
+
+        findings: list[Finding] = []
+        seen: set[str] = set()
+
+        for field_name, value in queries:
+            url = f"https://api.whoxy.com/?key={api_key}&reverse=whois&{field_name}={quote_plus(value)}&mode=domains"
+            try:
+                resp = requests.get(url, timeout=_TIMEOUT)
+                if not resp.ok:
+                    continue
+                data = resp.json()
+            except (requests.RequestException, ValueError) as exc:
+                logger.debug("whois_lookup: Whoxy reverse WHOIS failed for %s=%s: %s", field_name, value, exc)
+                continue
+
+            for d in data.get("domains_list", []):
+                val = str(d).strip().lower()
+                if not val:
+                    continue
+                ext = tldextract.extract(val)
+                if not (ext.domain and ext.suffix):
+                    continue
+                rd = f"{ext.domain}.{ext.suffix}"
+                if rd == domain or rd in seen:
+                    continue
+                if rd in _REGISTRAR_DOMAINS:
+                    continue
+                seen.add(rd)
+                findings.append(
+                    Finding(
+                        seed_domain=domain,
+                        associated_domain=rd,
+                        method="reverse_whois",
+                        evidence=f"same WHOIS registrant ({field_name}: {value}) as {domain}",
+                        raw_data={"field": field_name, "value": value},
+                        confidence="high",
+                    )
+                )
+
+        return findings
+
+    def _whoxy_whois(self, domain: str, api_key: str) -> dict | None:
+        url = f"https://api.whoxy.com/?key={api_key}&whois={quote_plus(domain)}"
+        try:
+            resp = requests.get(url, timeout=_TIMEOUT)
+            if not resp.ok:
+                return None
+            data = resp.json()
+            if data.get("status") != 1:
+                return None
+            return data.get("whois_data", {})
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("whois_lookup: Whoxy query failed for %s: %s", domain, exc)
+            return None
 
     def _query_rdap(self, domain: str) -> dict | None:
         try:

@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -9,6 +10,7 @@ from bs4 import BeautifulSoup
 
 from core.models import Finding
 from modules.base import ReconModule
+from modules.corroboration import _brand_tokens, _shares_brand_token
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,27 @@ class SiteScrapeModule(ReconModule):
             logger.warning("site_scrape: could not fetch homepage for %s over https or http", domain)
             return []
 
+        soup = BeautifulSoup(home_html, "html.parser")
+        title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
+        brand_tokens = _brand_tokens(domain, title)
+
+        findings: list[Finding] = []
+        seen = {domain}
+
+        # Check for root domain redirect
+        if base_url:
+            final_domain = self._registrable_domain(base_url)
+            if final_domain and final_domain != domain and final_domain not in seen:
+                seen.add(final_domain)
+                findings.append(Finding(
+                    seed_domain=domain,
+                    associated_domain=final_domain,
+                    method="site_redirect",
+                    evidence=f"Homepage redirects to {base_url} ({final_domain})",
+                    raw_data={"final_url": base_url},
+                    confidence="high",
+                ))
+
         robots = self._load_robots(base_url)
         home_links = self._extract_links(home_html, base_url)
         relationship_pages = self._pick_relationship_pages(home_links, domain)[:_MAX_RELATIONSHIP_PAGES]
@@ -109,8 +132,7 @@ class SiteScrapeModule(ReconModule):
             len(relationship_pages), len(home_links),
         )
 
-        seen = {domain}
-        findings = self._candidates_from_links(home_links, domain, base_url, seen)
+        findings.extend(self._candidates_from_links(home_links, domain, base_url, seen, brand_tokens, is_relationship_page=False))
 
         for page_url in relationship_pages:
             if robots and not robots.can_fetch(_USER_AGENT, page_url):
@@ -121,13 +143,52 @@ class SiteScrapeModule(ReconModule):
             if page_html is None:
                 continue
             page_links = self._extract_links(page_html, page_url)[:_MAX_LINKS_PER_PAGE]
-            findings.extend(self._candidates_from_links(page_links, domain, page_url, seen))
+            findings.extend(self._candidates_from_links(page_links, domain, page_url, seen, brand_tokens, is_relationship_page=True))
 
+        # Check robots.txt and sitemap.xml for domain references
+        findings.extend(self._extract_sitemap_robots_domains(domain, base_url, seen, brand_tokens))
+
+        return findings
+
+    def _extract_sitemap_robots_domains(
+        self, domain: str, base_url: str, seen: set[str], brand_tokens: list[str]
+    ) -> list[Finding]:
+        findings = []
+        for path in ("/robots.txt", "/sitemap.xml"):
+            _, text = self._fetch(urljoin(base_url, path))
+            if not text:
+                continue
+            for host in re.findall(r"(?:https?://)?(?:www\.)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})", text):
+                candidate = self._registrable_domain(host)
+                if (
+                    not candidate
+                    or candidate == domain
+                    or candidate.endswith(f".{domain}")
+                    or candidate in seen
+                    or candidate in _EXCLUDED_DOMAINS
+                ):
+                    continue
+                seen.add(candidate)
+                shares_brand = _shares_brand_token(candidate, brand_tokens)
+                if shares_brand:
+                    findings.append(Finding(
+                        seed_domain=domain,
+                        associated_domain=candidate,
+                        method="site_scrape_brand",
+                        evidence=f"Referenced in {domain}{path} and shares brand token: {candidate}",
+                        raw_data={"source": path, "host": host},
+                        confidence="medium",
+                    ))
         return findings
 
     @staticmethod
     def _candidates_from_links(
-        links: list[dict], domain: str, source_page: str, seen: set[str]
+        links: list[dict],
+        domain: str,
+        source_page: str,
+        seen: set[str],
+        brand_tokens: list[str],
+        is_relationship_page: bool = False,
     ) -> list[Finding]:
         findings = []
         for link in links:
@@ -140,15 +201,40 @@ class SiteScrapeModule(ReconModule):
                 or candidate in _EXCLUDED_DOMAINS
             ):
                 continue
+
+            shares_brand = _shares_brand_token(candidate, brand_tokens)
+
+            # Affiliation gate:
+            # 1. Links sharing the seed's brand token (nstp.pk on nust.edu.pk, geoit.tv on geo.tv)
+            #    are genuine sister brands -> medium confidence.
+            # 2. Links on dedicated relationship pages (subsidiaries, joint ventures) -> low confidence
+            #    lead needing corroboration.
+            # 3. Generic homepage links that share no brand token (social icons, external blogs,
+            #    vendors, payment gateways) are dropped to prevent massive third-party noise.
+            if not shares_brand and not is_relationship_page:
+                continue
+
             seen.add(candidate)
             text_note = f' (link text: "{link["text"][:80]}")' if link["text"] else ""
+            if shares_brand:
+                method = "site_scrape_brand"
+                conf = "medium"
+                ev = f"Linked from {domain}'s site ({source_page}){text_note} and shares brand token"
+            else:
+                method = "site_scrape_relationship"
+                conf = "low"
+                ev = (
+                    f"Linked from {domain}'s relationship page ({source_page}){text_note} "
+                    f"— unconfirmed lead, needs corroboration"
+                )
+
             findings.append(Finding(
                 seed_domain=domain,
                 associated_domain=candidate,
-                method="site_scrape",
-                evidence=f"Linked from {domain}'s own site, on the page {source_page}{text_note}",
+                method=method,
+                evidence=ev,
                 raw_data={"source_page": source_page, "link": link["url"], "link_text": link["text"]},
-                confidence="high",
+                confidence=conf,
             ))
         return findings
 

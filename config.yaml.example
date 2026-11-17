@@ -3,6 +3,7 @@ censys_personal_access_token: null   # Platform API bearer PAT, not an API ID+se
 censys_organization_id: null          # optional; Free-tier accounts don't have one
 securitytrails_api_key: null
 whoisxml_api_key: null
+whoxy_api_key: null
 builtwith_api_key: null
 google_search_api_key: null
 google_search_cx: null

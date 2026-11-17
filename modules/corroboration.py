@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 
 import dns.exception
@@ -13,6 +14,62 @@ _DNS_TIMEOUT = 4.0
 _HTTP_TIMEOUT = 8.0
 _USER_AGENT = "DomainHunter/0.1"
 _BGPVIEW_IP_URL = "https://api.bgpview.io/ip/{ip}"
+
+# Generic single words that routinely show up in titles/domains and would
+# otherwise become a "brand token" matching unrelated domains.
+_BRAND_STOPWORDS = frozenset({
+    "the", "and", "for", "new", "live", "news", "latest", "breaking", "today",
+    "daily", "online", "watch", "video", "report", "update", "updates", "show",
+    "home", "official", "website", "network", "group", "media", "www",
+    "site", "sites", "page", "pages", "portal", "welcome", "world", "global",
+    "store", "shop", "app", "apps", "mobile", "digital", "tv",
+})
+
+
+def _safe_tokens(text: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", text):
+        cleaned = token.lower().strip("-.")
+        if cleaned and cleaned not in tokens:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _seed_base_tokens(seed_root: str) -> list[str]:
+    """Brand tokens from the seed's own label. Digit-led labels keep only the
+    collapsed form ('1800flowers'); letter labels keep their word fragments."""
+    base = seed_root.split(".")[0].lower()
+    if base[:1].isdigit():
+        collapsed = re.sub(r"[^a-z0-9]", "", base)
+        return [collapsed] if len(collapsed) >= 3 else []
+    tokens = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", base):
+        cleaned = token.strip("-.")
+        if cleaned and cleaned not in tokens:
+            tokens.append(cleaned)
+    collapsed = re.sub(r"[^a-z0-9]", "", base)
+    if collapsed and collapsed not in tokens:
+        tokens.append(collapsed)
+    return tokens
+
+
+def _brand_tokens(seed_root: str, title_text: str = "") -> list[str]:
+    tokens = list(_seed_base_tokens(seed_root))
+    for token in _safe_tokens(title_text):
+        if token not in tokens and token not in _BRAND_STOPWORDS and len(token) > 3:
+            tokens.append(token)
+    return tokens[:8]
+
+
+def _shares_brand_token(domain: str, brand_tokens: list[str]) -> bool:
+    """True when the candidate's label contains a seed brand token.
+    Forward substring only (geo -> geoit, tesla -> teslamotors)."""
+    label = domain.split(".")[0].lower()
+    collapsed = re.sub(r"[^a-z0-9]", "", label)
+    for token in brand_tokens:
+        if len(token) >= 3 and token in collapsed:
+            return True
+    return False
 
 # Substrings of shared mail/ESP and DNS-hosting providers used by huge
 # numbers of unrelated organizations -- an NS/MX match against one of these
@@ -64,6 +121,7 @@ class SeedContext:
     seed_mx_domains: set[str] = field(default_factory=set)
     seed_asns: set[int] = field(default_factory=set)
     seed_favicon_md5: str | None = None
+    seed_brand_tokens: list[str] = field(default_factory=list)
 
 
 def corroborate(candidate: str, seed_domain: str, context: "SeedContext | None") -> tuple[str | None, str | None]:
@@ -101,6 +159,9 @@ def corroborate(candidate: str, seed_domain: str, context: "SeedContext | None")
         candidate_hash = _favicon_md5(candidate)
         if candidate_hash and candidate_hash == context.seed_favicon_md5:
             return "favicon_hash", "identical favicon MD5 hash to the seed"
+
+    if context.seed_brand_tokens and _shares_brand_token(candidate, context.seed_brand_tokens):
+        return "brand_token", f"candidate label matches seed brand token(s) {context.seed_brand_tokens}"
 
     return None, None
 

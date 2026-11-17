@@ -18,6 +18,7 @@ _SERVICE_KEYS = {
     "censys": ["censys_personal_access_token"],
     "securitytrails": ["securitytrails_api_key"],
     "whoisxml": ["whoisxml_api_key"],
+    "whoxy": ["whoxy_api_key"],
     "builtwith": ["builtwith_api_key"],
     "google_search": ["google_search_api_key", "google_search_cx"],
     "llm": ["llm_provider", "llm_api_key"],
@@ -37,9 +38,14 @@ class APIConfig:
             return cls(yaml.safe_load(f) or {})
 
     def has(self, service: str) -> bool:
-        """True if every key required for `service` is present and truthy."""
+        """True if every key required for `service` is present and truthy (in config or env)."""
         required = _SERVICE_KEYS.get(service, [f"{service}_api_key"])
-        return all(self._data.get(key) for key in required)
+        return all(self.get(key) for key in required)
 
     def get(self, key: str, default=None):
-        return self._data.get(key, default)
+        import os
+        val = self._data.get(key)
+        if val is not None and str(val).strip():
+            return val
+        env_val = os.environ.get(key.upper()) or os.environ.get(key)
+        return env_val if env_val is not None and str(env_val).strip() else default
