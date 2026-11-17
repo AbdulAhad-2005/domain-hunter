@@ -106,6 +106,12 @@ class WhoisLookupModule(ReconModule):
         seen: set[str] = set()
 
         for field_name, value in queries:
+                        low = value.lower()
+            if (
+                any(w in low for w in ("privacy", "proxy", "redacted", "protected", "withheld", "whoisguard"))
+                or low.split("@")[-1] in _REGISTRAR_DOMAINS
+            ):
+                continue
             url = f"https://api.whoxy.com/?key={api_key}&reverse=whois&{field_name}={quote_plus(value)}&mode=domains"
             try:
                 resp = requests.get(url, timeout=_TIMEOUT)
